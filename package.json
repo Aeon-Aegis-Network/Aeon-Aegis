@@ -5,10 +5,11 @@
   "type": "module",
   "main": "dist/src/relay.js",
   "scripts": {
-    "build": "node ./node_modules/typescript/bin/tsc",
-    "start:relay": "node ./node_modules/tsx/dist/cli.mjs src/relay.ts",
-    "start:origin": "node ./node_modules/tsx/dist/cli.mjs src/mock-origin.ts",
-    "benchmark": "node ./node_modules/tsx/dist/cli.mjs tests/benchmark.ts"
+    "dev": "tsx src/relay.ts",
+    "start:relay": "tsx src/relay.ts",
+    "start:origin": "tsx src/mock-origin.ts",
+    "build": "tsc",
+    "benchmark": "tsx tests/benchmark.ts"
   },
   "keywords": [
     "p2p",

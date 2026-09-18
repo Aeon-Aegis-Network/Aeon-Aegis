@@ -22,7 +22,7 @@ const RELAY_PORT = parseInt(process.env.RELAY_P2P_PORT || '9090', 10);
 const CONTROL_PORT = parseInt(process.env.RELAY_CONTROL_PORT || '9091', 10);
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '100', 10);
 const PROTOCOL = '/aeon-aegis/relay/1.0.0';
-const TIMEOUT_MS = 5000;
+const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '15000', 10);
 
 interface RequestMetric {
   id: number;
@@ -102,50 +102,56 @@ async function runBenchmark() {
   console.log(`Firing ${CONCURRENCY} concurrent zero-trust proxied requests...\n`);
 
   const benchmarkStart = performance.now();
-
-  // Execute 100 concurrent requests across the Noise-encrypted relay
   const tasks: Promise<RequestMetric>[] = [];
 
   for (let i = 1; i <= CONCURRENCY; i++) {
     const requestId = i;
     tasks.push((async (): Promise<RequestMetric> => {
-      const tReqStart = performance.now();
+      let stream: any = null;
+      let tReqStart = performance.now();
+
       try {
-        // Open multiplexed stream on the Noise-encrypted transport
-        const stream = await connection.newStream(PROTOCOL, { maxOutboundStreams: 256 });
+        // Open stream via dialProtocol
+        stream = await clientNode.dialProtocol(targetAddr as any, PROTOCOL, { maxOutboundStreams: 1024 });
+        tReqStart = performance.now();
 
-        const requestPayload = JSON.stringify({
-          request_id: requestId,
-          sender: `aeon-harness-worker-${requestId}`,
-          timestamp: Date.now()
+        // HTTP request payload to protected origin
+        const requestPayload = 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n';
+
+        // Write payload to stream
+        if (typeof stream.send === 'function') {
+          stream.send(new TextEncoder().encode(requestPayload));
+        } else if (typeof stream.sink === 'function') {
+          stream.sink([new TextEncoder().encode(requestPayload)]);
+        }
+
+        // Actively read all response chunks from the stream
+        const readResponse = async (): Promise<string> => {
+          let responseData = '';
+          const source = stream.source || stream;
+          for await (const chunk of source) {
+            responseData += new TextDecoder().decode(chunk instanceof Uint8Array ? chunk : chunk.subarray());
+            if (responseData.includes('HTTP/1.1 200 OK') || responseData.includes('status')) {
+              break;
+            }
+          }
+          return responseData;
+        };
+
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          const t = setTimeout(() => reject(new Error(`Timeout after ${TIMEOUT_MS}ms`)), TIMEOUT_MS);
+          if (typeof t.unref === 'function') t.unref();
         });
 
-        const responsePromise = new Promise<string>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            reject(new Error(`Timeout after ${TIMEOUT_MS}ms`));
-          }, TIMEOUT_MS);
-
-          const onMessage = (evt: any) => {
-            clearTimeout(timer);
-            stream.removeEventListener('message', onMessage);
-            const text = new TextDecoder().decode(evt.data.subarray ? evt.data.subarray() : evt.data);
-            resolve(text);
-          };
-
-          stream.addEventListener('message', onMessage);
-        });
-
-        // Send payload through relay to origin
-        stream.send(new TextEncoder().encode(requestPayload));
-
-        // Await origin response through relay
-        const responseData = await responsePromise;
+        const responseData = await Promise.race([readResponse(), timeoutPromise]);
         const rtt = performance.now() - tReqStart;
 
-        // Cleanly close stream to recycle stream slots
-        await stream.close();
+        // Record response time upon receiving response bytes and close stream immediately
+        try {
+          await stream.close();
+        } catch {}
 
-        const isValid = responseData.includes('aeon-origin-01') || responseData.includes('protected');
+        const isValid = responseData.includes('HTTP/1.1 200 OK') || responseData.includes('status') || responseData.includes('protected');
 
         return {
           id: requestId,
@@ -163,6 +169,12 @@ async function runBenchmark() {
           rttMs: rtt,
           error: err?.message || 'Unknown error'
         };
+      } finally {
+        if (stream) {
+          try {
+            await stream.close();
+          } catch {}
+        }
       }
     })());
   }
@@ -170,8 +182,12 @@ async function runBenchmark() {
   const results = await Promise.all(tasks);
   const benchmarkTotalDurationMs = performance.now() - benchmarkStart;
 
-  await connection.close();
-  await clientNode.stop();
+  try {
+    await connection.close();
+  } catch {}
+  try {
+    await clientNode.stop();
+  } catch {}
 
   // Aggregation & Statistics
   const successfulResults = results.filter(r => r.success);

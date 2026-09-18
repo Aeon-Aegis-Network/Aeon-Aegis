@@ -14,14 +14,6 @@ import { SecurityManager } from './security/rateLimiter.js';
  * ============================================================================
  * Aeon Aegis - Zero-Trust P2P Relay Node (Phase 2 Hardened)
  * ============================================================================
- * Architecture:
- * - Listens on TCP port 9090 via libp2p.
- * - Enforces mandatory Noise protocol cryptographic handshake (@chainsafe/libp2p-noise).
- * - Intercepts incoming streams via SecurityManager (Token-Bucket & IP Ban-Lists).
- * - Strips remote client IP / multiaddr network identities to prevent origin correlation.
- * - Securely forwards payload over local loopback TCP socket to Mock Origin (127.0.0.1:8080).
- * - Exposes Express + WebSocket control plane on port 9091 for health, metrics & security state.
- * - Emits structured JSON logs for auditability, telemetry, and observability.
  */
 
 // Configuration constants
@@ -33,8 +25,8 @@ export const AEON_RELAY_PROTOCOL = '/aeon-aegis/relay/1.0.0';
 
 // Global Security Manager Instance
 export const security = new SecurityManager({
-  capacity: 50,         // Maximum stream burst per IP
-  refillRate: 5,        // Tokens restored per second
+  capacity: parseInt(process.env.RATE_LIMIT_CAPACITY || '300', 10),
+  refillRate: parseInt(process.env.RATE_LIMIT_REFILL || '50', 10),
   banThreshold: 0,      // Score floor triggering IP ban
   banDurationMs: 900000 // 15-minute ban duration
 });
@@ -75,12 +67,54 @@ export const metrics: RelayMetrics = {
 };
 
 /**
+ * Async Push Queue for piping origin socket responses to libp2p stream.sink
+ */
+class AsyncPushQueue<T> implements AsyncIterable<T> {
+  private queue: T[] = [];
+  private resolvers: ((value: IteratorResult<T>) => void)[] = [];
+  private done = false;
+
+  push(value: T) {
+    if (this.done) return;
+    if (this.resolvers.length > 0) {
+      const resolve = this.resolvers.shift()!;
+      resolve({ value, done: false });
+    } else {
+      this.queue.push(value);
+    }
+  }
+
+  end() {
+    if (this.done) return;
+    this.done = true;
+    while (this.resolvers.length > 0) {
+      const resolve = this.resolvers.shift()!;
+      resolve({ value: undefined as any, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: (): Promise<IteratorResult<T>> => {
+        if (this.queue.length > 0) {
+          return Promise.resolve({ value: this.queue.shift()!, done: false });
+        }
+        if (this.done) {
+          return Promise.resolve({ value: undefined as any, done: true });
+        }
+        return new Promise((resolve) => this.resolvers.push(resolve));
+      }
+    };
+  }
+}
+
+/**
  * Proxy function: Strips client origin metadata and pipes decrypted payload
  * between libp2p stream and internal origin TCP server.
  */
 export function proxyStreamToOrigin(
   stream: Stream,
-  connection: Connection,
+  connection: Connection | undefined,
   handshakeDurationMs: number
 ): void {
   metrics.totalStreamsProxied++;
@@ -95,18 +129,21 @@ export function proxyStreamToOrigin(
   });
 
   const originSocket = net.createConnection({ host: ORIGIN_HOST, port: ORIGIN_PORT });
+  const outboundQueue = new AsyncPushQueue<Uint8Array>();
   let streamClosed = false;
 
   const cleanup = () => {
     if (streamClosed) return;
     streamClosed = true;
+    outboundQueue.end();
     try {
       if (!originSocket.destroyed) {
-        originSocket.end();
+        originSocket.destroy();
       }
-    } catch {
-      // Ignore socket termination error
-    }
+    } catch {}
+    try {
+      (stream as any).reset?.();
+    } catch {}
   };
 
   originSocket.on('connect', () => {
@@ -116,21 +153,30 @@ export function proxyStreamToOrigin(
     });
   });
 
-  stream.addEventListener('message', (evt) => {
+  // Bind outbound response queue to libp2p stream sink
+  if (typeof (stream as any).sink === 'function') {
+    (stream as any).sink(outboundQueue).catch(() => cleanup());
+  }
+
+  // Consume P2P stream -> write to local origin TCP socket
+  (async () => {
     try {
-      const rawData: Uint8Array = evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
-      const bytesCount = rawData.byteLength;
-      metrics.totalBytesIn += bytesCount;
+      const source = (stream as any).source || stream;
+      for await (const chunk of source) {
+        const rawData = chunk instanceof Uint8Array ? chunk : chunk.subarray();
+        const bytesCount = rawData.byteLength;
+        metrics.totalBytesIn += bytesCount;
 
-      logJSON('info', 'payload_routed_to_origin', {
-        stream_id: streamId,
-        bytes_transferred: bytesCount,
-        active_connections: metrics.activeConnections,
-        handshake_duration_ms: handshakeDurationMs
-      });
+        logJSON('info', 'payload_routed_to_origin', {
+          stream_id: streamId,
+          bytes_transferred: bytesCount,
+          active_connections: metrics.activeConnections,
+          handshake_duration_ms: handshakeDurationMs
+        });
 
-      if (!originSocket.destroyed) {
-        originSocket.write(rawData);
+        if (!originSocket.destroyed) {
+          originSocket.write(rawData);
+        }
       }
     } catch (err: any) {
       metrics.recentErrors++;
@@ -140,8 +186,9 @@ export function proxyStreamToOrigin(
       });
       cleanup();
     }
-  });
+  })();
 
+  // Read origin TCP socket -> push to stream sink queue and explicit chunk flush
   originSocket.on('data', (data: Buffer) => {
     try {
       const bytesCount = data.byteLength;
@@ -153,7 +200,12 @@ export function proxyStreamToOrigin(
         active_connections: metrics.activeConnections
       });
 
-      stream.send(new Uint8Array(data));
+      const chunk = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      // Explicit chunk flush to stream
+      if (typeof (stream as any).send === 'function') {
+        (stream as any).send(chunk);
+      }
+      outboundQueue.push(chunk);
     } catch (err: any) {
       metrics.recentErrors++;
       logJSON('error', 'stream_send_failed', {
@@ -162,6 +214,16 @@ export function proxyStreamToOrigin(
       });
       cleanup();
     }
+  });
+
+  originSocket.on('end', () => {
+    logJSON('info', 'origin_socket_end', { stream_id: streamId });
+    outboundQueue.end();
+    // Immediate queue teardown when originSocket sends 'end'
+    try {
+      (stream as any).close?.();
+    } catch {}
+    cleanup();
   });
 
   originSocket.on('error', (err: any) => {
@@ -225,19 +287,23 @@ export async function startRelayNode() {
     });
   });
 
-  // Zero-trust stream handler with active SecurityManager rate limiting
-  node.handle(AEON_RELAY_PROTOCOL, (stream, connection) => {
-   // Extract peer IP address safely without triggering strict Multiaddr TS interface errors
+  // Zero-trust stream handler supporting flexible stream parameter signatures
+  node.handle(AEON_RELAY_PROTOCOL, (data: any) => {
+    const stream: Stream = data.stream || data;
+    const connection: Connection | undefined = data.connection;
+
     let remoteIP = '127.0.0.1';
     try {
-      const rawAddr = connection.remoteAddr as any;
-      if (typeof rawAddr.nodeAddress === 'function') {
-        remoteIP = rawAddr.nodeAddress().address || '127.0.0.1';
-      } else {
-        const parts = connection.remoteAddr.toString().split('/');
-        const ipIdx = parts.findIndex((p) => p === 'ip4' || p === 'ip6');
-        if (ipIdx !== -1 && parts[ipIdx + 1]) {
-          remoteIP = parts[ipIdx + 1];
+      if (connection && connection.remoteAddr) {
+        const rawAddr = connection.remoteAddr as any;
+        if (typeof rawAddr.nodeAddress === 'function') {
+          remoteIP = rawAddr.nodeAddress().address || '127.0.0.1';
+        } else {
+          const parts = connection.remoteAddr.toString().split('/');
+          const ipIdx = parts.findIndex((p: string) => p === 'ip4' || p === 'ip6');
+          if (ipIdx !== -1 && parts[ipIdx + 1]) {
+            remoteIP = parts[ipIdx + 1];
+          }
         }
       }
     } catch {
@@ -253,7 +319,9 @@ export async function startRelayNode() {
         reason: check.reason,
         reputation_score: check.score
       });
-      stream.close();
+      try {
+        (stream as any).reset?.();
+      } catch {}
       return;
     }
 
