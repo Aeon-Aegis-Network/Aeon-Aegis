@@ -4,12 +4,13 @@
   "description": "Zero-trust P2P relay infrastructure masking origin IPs and shielding node endpoints",
   "type": "module",
   "main": "dist/src/relay.js",
-  "scripts": {
+ "scripts": {
     "dev": "tsx src/relay.ts",
     "start:relay": "tsx src/relay.ts",
     "start:origin": "tsx src/mock-origin.ts",
     "build": "tsc",
-    "benchmark": "tsx tests/benchmark.ts"
+    "benchmark": "tsx tests/benchmark.ts",
+    "generate-certs": "tsx scripts/generateCerts.ts"
   },
   "keywords": [
     "p2p",

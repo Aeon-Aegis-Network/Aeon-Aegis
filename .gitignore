@@ -24,3 +24,7 @@ mkdir AeonAegis
 mkdir AeonAegis/
 mkdir AeonAegis/**
 [mM]kdir*AeonAegis*
+
+# Security & PKI Credentials
+certs/*.key
+certs/*.srl

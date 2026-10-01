@@ -1,42 +1,50 @@
----
 version: "2.0"
 
 services:
-  relay:
-    image: ghcr.io/aeon-aegis-network/aeon-aegis:latest
+  aeon-relay:
+    image: ghcr.io/aeon-aegis-network/aeon-aegis:latest
     expose:
+      # WireGuard UDP Overlay Gateway
+      - port: 51820
+        as: 51820
+        proto: udp
+        to:
+          - global: true
+      # Noise P2P Relay Listener
       - port: 9090
         as: 9090
         proto: tcp
         to:
           - global: true
+      # mTLS Control & Telemetry Plane
       - port: 9091
         as: 9091
         proto: tcp
         to:
           - global: true
     env:
-      - "NODE_ENV=production"
-      - "RELAY_P2P_PORT=9090"
-      - "RELAY_CONTROL_PORT=9091"
-      - "ORIGIN_HOST=127.0.0.1"
-      - "ORIGIN_PORT=8080"
+      - NODE_ENV=production
+      - RELAY_LISTEN_HOST=10.0.0.1
+      - RELAY_P2P_PORT=9090
+      - RELAY_CONTROL_PORT=9091
+      - ORIGIN_HOST=127.0.0.1
+      - ORIGIN_PORT=8080
 
 profiles:
   compute:
     aeon-relay:
       resources:
         cpu:
-          units: 0.5
+          units: 1.0
         memory:
-          size: 512Mi
+          size: 1Gi
         storage:
           size: 2Gi
   placement:
     akash:
       pricing:
         aeon-relay:
-          denom: uact
+          denom: uakt
           amount: 10000
 
 deployment:
