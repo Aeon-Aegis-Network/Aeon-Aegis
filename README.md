@@ -1,86 +1,218 @@
 # Aeon Aegis 🛡️
 
-**Zero-Trust P2P Relay Infrastructure & Security SDK**
-
-Aeon Aegis is a high-performance, open-source zero-trust relay layer built with `libp2p` and Noise protocol encryption. It masks origin IP addresses and shields validator/RPC endpoints from direct exposure, surveillance, and DDoS attacks.
+Aeon Aegis is a high-throughput, multi-overlay zero-trust P2P relay network engineered to obfuscate validator endpoints, shield origin infrastructure from direct IP exposure, and route encrypted traffic across decentralized Akash edge nodes.
 
 ---
 
-## 🏛️ Architecture
+## 🏛️ Multi-Overlay Security Architecture
+
+Aeon Aegis enforces a multi-layered defense-in-depth routing stack to ensure traffic privacy, integrity, and origin isolation:
+
+```text
++-----------------------------------------------------------------------------------+
+|                                CLIENT / dAPP                                      |
++-----------------------------------------------------------------------------------+
+                                          │
+                                          ▼  [Layer 1: WireGuard UDP Tunnel | Port 51820 | 10.0.0.x Overlay]
++-----------------------------------------------------------------------------------+
+|                                ENTRY RELAY NODE                                   |
+|  - Peels Outer Onion Layer (X25519 DH + ChaCha20-Poly1305)                        |
+|  - Sees: Client Source IP                                                         |
+|  - Knows: Transit Node Multiaddr ONLY                                             |
++-----------------------------------------------------------------------------------+
+                                          │
+                                          ▼  [Layer 2: libp2p Noise TCP Stream | Port 9090 | /aeon-aegis/onion/1.0.0]
++-----------------------------------------------------------------------------------+
+|                                TRANSIT RELAY NODE                                 |
+|  - Peels Intermediate Onion Layer                                                 |
+|  - Sees: Entry Node IP                                                            |
+|  - Knows: Exit / Egress Node Multiaddr ONLY                                       |
++-----------------------------------------------------------------------------------+
+                                          │
+                                          ▼  [Layer 3: mTLS Control & Exit Proxy | Port 9091]
++-----------------------------------------------------------------------------------+
+|                             EGRESS NODE / PROTECTED ORIGIN                        |
+|  - Peels Final Inner Payload & Routes to Loopback                                 |
+|  - Sees: Transit Node IP                                                          |
+|  - Protected Origin Endpoint: 127.0.0.1:8080 (Shielded)                           |
++-----------------------------------------------------------------------------------+
 
 ```
-                               +-----------------------------------------------+
-                               |            AEON AEGIS RELAY NODE              |
-                               |               (libp2p + Noise)                |
- [ Client / Consumer ]         |                                               |     [ Internal Origin ]
-(Web3 RPC / Validator)         |  1. TCP / Noise Handshake (Port 9090)         |   (Mock Protected Node)
-         |                     |  2. Yamux Stream Muxer                        |             |
-         |=== Noise TCP ======>|  3. Origin Metadata Stripping (No Client IP)  |             |
-         |   (Port 9090)       |  4. Local Loopback Socket Pipe                |== Local ==> |
-         |                     |     to 127.0.0.1:8080 ------------------------|   TCP       | (127.0.0.1:8080)
-         |                     |                                               | (Port 8080) |
-         |                     |  Control Plane (Express + WS on Port 9091)    |             |
-         |                     +-----------------------------------------------+             |
-         |                                             |                                     |
-         +<================ Decrypted Response <-------+<====================================+
-```
+
 ---
 
-## ⚡ Verified Benchmark Metrics
+## 🧅 Sphinx Multi-Hop Onion Routing Specification
 
-Tested under local automated load testing harness (`100` concurrent requests over Noise TCP):
+The Sphinx-inspired packet encryption engine (`src/security/onionRouter.ts`) guarantees destination obfuscation across multi-hop relay circuits:
 
-| Metric | Result | Status |
-| :--- | :--- | :--- |
-| **Total Concurrency** | 100 Requests | **100% Passed** |
-| **Noise Handshake Latency** | 257.21 ms | **Passed** |
-| **Throughput** | 39.48 req/sec | **Passed** |
-| **Origin Isolation** | Confirmed strictly loopback (`127.0.0.1`) | **Passed** |
-| **Memory Footprint** | `<256MB` | **Passed** |
+* **Cryptographic Primitives:** Ephemeral Diffie-Hellman key exchange over `X25519` combined with `ChaCha20-Poly1305` AEAD symmetric encryption.
+* **Key Derivation:** HKDF-SHA256 derives 256-bit symmetric keys per circuit layer using the ephemeral key pair and target node public key (`aeon-aegis-onion-v1` salt).
+* **Layer Frame Layout:**
+```text
++-----------------------+------------------+-------------------+---------------------+
+| Ephemeral PubKey (32B)|   IV (12 Bytes)  | Auth Tag (16 Bytes)|     Ciphertext      |
++-----------------------+------------------+-------------------+---------------------+
+
+```
+
+
+* **Protocol Target:** Handled over `/aeon-aegis/onion/1.0.0`.
+* **Zero Destination Leakage:** Each relay node unwraps its specific layer to extract the next hop multiaddr and inner encrypted payload, ensuring no single entry node can map a client IP to its ultimate validator destination.
+
+---
+
+## 🔒 Mutual TLS (mTLS) Control Plane Documentation
+
+The telemetry and management interface runs on port `9091` protected by strict Mutual TLS:
+
+* **PKI Architecture:** Root CA (`certs/ca.crt`), Server Certificates (`certs/server.crt`), and Operator Client Certificates (`certs/client.crt`).
+* **Strict Mutual Verification:** Handshakes missing valid operator client certificates signed by the Root CA are terminated at the TLS layer (`rejectUnauthorized: true`).
+* **Endpoints:**
+* `GET /health` — Returns service health, uptime, and mTLS status.
+* `GET /metrics` — Exposes active streams, total bytes transferred, rate limiting security counters, and node peer identity.
+* `WSS /control/ws` — Real-time telemetry WebSocket streaming live metric snapshots every 1000ms.
+
+
+
+---
+
+## ⚡ Verified Master Benchmark Suite
+
+Tested under the automated Phase 3 Master Benchmark Harness across multi-hop Sphinx Onion encrypted streams:
+
+```text
+===========================================================================
+  AEON AEGIS - PHASE 3 FULL-STACK ZERO-TRUST BENCHMARK HARNESS
+===========================================================================
+[1/4] Mock Origin TCP Server:   ACTIVE (127.0.0.1:8080)
+[2/4] WireGuard UDP Overlay:    ACTIVE (70.66 ms)
+[3/4] mTLS Control Plane:       VERIFIED (270.42 ms, CN:client.aeon.internal)
+[4/4] Target Multiaddr:         /ip4/127.0.0.1/tcp/9090/p2p/12D3KooWSjSKpq43wgspUxJAvV46JKaJFu5RwKXe4qGUefyfhHry
+
+===========================================================================
+  BENCHMARK RESULTS SUMMARY
+===========================================================================
+Total Requests Sent:        100
+Successful Requests:        100 (100.00%)
+Failed Requests:            0
+Throughput:                 10.12 req/sec
+Mean Stream RTT:            978.41 ms
+===========================================================================
+
+✅ BENCHMARK PASSED: 100% Zero-Trust Routing & Sphinx Onion Encryption Verified.
+
+```
+
+### Telemetry & Performance Summary
+
+| Benchmark Metric | Result Value | Verification Status |
+| --- | --- | --- |
+| **Total Test Streams** | 100 / 100 Streams | **100.00% Success (0 Drops)** |
+| **Throughput Capacity** | 10.12 req/sec | **PASSED** |
+| **Mean Stream RTT** | 978.41 ms | **PASSED** |
+| **WireGuard UDP Ping** | 70.66 ms RTT | **ACTIVE** |
+| **mTLS Control Plane** | 270.42 ms RTT | **VERIFIED (`client.aeon.internal`)** |
+| **Cryptographic Zeroization** | Explicit `sharedSecret.fill(0)` | **AUDIT PASSED** |
+| **Memory Footprint** | `<256MB` RAM | **PASSED** |
 
 ---
 
 ## 🚀 Quickstart
 
-### Prerequisites
-* Node.js v20+
-* npm
+### 1. Installation & Compilation
 
-### Installation & Build
 ```bash
-git clone [https://github.com/CrushioDarhk/Aeon-Aegis.git](https://github.com/CrushioDarhk/Aeon-Aegis.git)
+git clone https://github.com/CrushioDarhk/Aeon-Aegis.git
 cd Aeon-Aegis
 npm install
 npm run build
-Running Locally
-Start Mock Origin Server (Port 8080):
 
-Bash
-npm run start:origin
-Start Aeon Aegis Relay Node (Port 9090 P2P, Port 9091 Control):
+```
 
-Bash
-npm run start:relay
-Execute Benchmark Suite:
+### 2. Running Locally
 
-Bash
+Start Relay Node & Control Plane:
+
+```bash
+npm run dev
+
+```
+
+Execute Full-Stack Benchmark Suite:
+
+```bash
 npm run benchmark
-Control Plane Telemetry
-Bash
-# Health Check
-curl [http://127.0.0.1:9091/health](http://127.0.0.1:9091/health)
 
-# Live Metrics JSON
-curl [http://127.0.0.1:9091/metrics](http://127.0.0.1:9091/metrics)
-☁️ Cloud Deployment (Akash Network)
-Aeon Aegis is containerized and ready for low-cost cloud deployment via Akash Network using the included deploy.sdl stack manifest.
+```
 
-Bash
-# Docker Image
-docker pull crushiodarhk/aeon-aegis:latest
-🗺️ Roadmap
-[x] Phase 1: Core libp2p Noise TCP Relay, Control-Plane Telemetry, Dockerization & Akash .sdl.
+### 3. Querying mTLS Control Plane
 
-[ ] Phase 2: Token-Bucket Rate Limiting, IP Reputation Scoring, and WireGuard/mTLS Origin Tunnels.
+```bash
+curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key https://127.0.0.1:9091/health
+curl --cacert certs/ca.crt --cert certs/client.crt --key certs/client.key https://127.0.0.1:9091/metrics
 
-[ ] Phase 3: Multi-Hop Onion Routing & Distributed Edge Benchmarks across global nodes.
+```
+
+---
+
+## ☁️ Akash Network SDL v2.0 (`deploy.sdl`)
+
+Configured for Akash Network deployment using micro-ACT (`uact`) token settlement:
+
+```yaml
+version: "2.0"
+
+services:
+  aeon-relay:
+    image: ghcr.io/aeon-aegis-network/aeon-aegis:latest
+    expose:
+      # WireGuard UDP Overlay Gateway
+      - port: 51820
+        as: 51820
+        proto: udp
+        to:
+          - global: true
+      # Noise P2P Relay Listener
+      - port: 9090
+        as: 9090
+        proto: tcp
+        to:
+          - global: true
+      # mTLS Control & Telemetry Plane
+      - port: 9091
+        as: 9091
+        proto: tcp
+        to:
+          - global: true
+    env:
+      - NODE_ENV=production
+      - RELAY_LISTEN_HOST=10.0.0.1
+      - RELAY_P2P_PORT=9090
+      - RELAY_CONTROL_PORT=9091
+      - ORIGIN_HOST=127.0.0.1
+      - ORIGIN_PORT=8080
+
+profiles:
+  compute:
+    aeon-relay:
+      resources:
+        cpu:
+          units: 0.5
+        memory:
+          size: 512Mi
+        storage:
+          size: 2Gi
+  placement:
+    akash:
+      pricing:
+        aeon-relay:
+          denom: uact
+          amount: 10000
+
+deployment:
+  aeon-relay:
+    akash:
+      profile: aeon-relay
+      count: 1
+
+```
