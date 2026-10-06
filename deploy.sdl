@@ -35,9 +35,9 @@ profiles:
     aeon-relay:
       resources:
         cpu:
-          units: 1.0
+          units: 0.5
         memory:
-          size: 1Gi
+          size: 512Mi
         storage:
           size: 2Gi
   placement:
